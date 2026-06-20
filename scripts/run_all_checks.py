@@ -4,10 +4,10 @@ run_all_checks.py
 
 Master orchestrator for the "Vibe Coded, Vibe Hacked" research paper.
 
-Walks the /generated_code/{model}/{language}/{condition}/PNN.ext structure,
-runs all four security checks on every file, and saves:
-  1. Raw tool output (JSON/text) per file per tool -> /scan_results/
-  2. One aggregated row per file -> /analysis/master_results.csv
+Walks {LANGUAGE}_generated_code/{model}/{naive|hinted}/promptN.ext, runs all
+four security checks on every file, and saves:
+  1. Raw tool output (JSON) per file per tool -> scan_results/{language}/{model}/{condition}/
+  2. One aggregated row per file -> analysis/master_results.csv
 
 Tools orchestrated:
   - TruffleHog   (secrets detection)
@@ -18,9 +18,35 @@ Tools orchestrated:
 SonarQube is intentionally run separately (sonar-scanner requires a project-
 level invocation, not a clean single-file CLI call) -- see run_sonarqube.sh.
 
+--------------------------------------------------------------------------
+IMPORTANT -- ONE-TIME SETUP TO AVOID TIMEOUTS (read this before running):
+--------------------------------------------------------------------------
+1. Semgrep was timing out because "--config p/owasp-top-ten" pulls the
+   ruleset from Semgrep's registry over the network on every single run.
+   Fix: download the ruleset ONCE, then this script uses the local copy:
+
+       semgrep --config p/owasp-top-ten --json --dryrun . > /dev/null 2>&1
+       (or simply run semgrep once manually on any file; it caches the
+       ruleset locally under ~/.semgrep/cache automatically)
+
+2. Trivy was timing out because the FIRST run downloads its vulnerability
+   database (several hundred MB). Fix: download it ONCE before batch-
+   scanning:
+
+       trivy fs --download-db-only
+
+   After that, every scan reuses the local DB and is fast.
+
+Run both one-time steps once, then run this script normally -- timeouts
+should disappear for all subsequent runs.
+--------------------------------------------------------------------------
+
 Usage:
-    python3 run_all_checks.py
-    (run from the repository root; expects ./generated_code to exist)
+    python3 run_all_checks.py <language>
+    where <language> is one of: python, javascript, java
+
+    Example:
+        python3 run_all_checks.py python
 
 Requirements:
     - semgrep, trivy, trufflehog must be on PATH
@@ -36,11 +62,15 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-GENERATED_CODE_DIR = REPO_ROOT / "generated_code_Python/"
 SCAN_RESULTS_DIR = REPO_ROOT / "scan_results"
 ANALYSIS_DIR = REPO_ROOT / "analysis"
 SLOPSQUATTING_SCRIPT = Path(__file__).resolve().parent / "slopsquatting_checker.py"
 
+LANG_FOLDER_NAMES = {
+    "python": "Python_generated_code",
+    "javascript": "JavaScript_generated_code",
+    "java": "Java_generated_code",
+}
 LANG_EXTENSIONS = {"python": ".py", "javascript": ".js", "java": ".java"}
 
 CSV_FIELDS = [
@@ -70,7 +100,7 @@ def run_cmd(cmd, timeout=60):
 def run_trufflehog(file_path: Path, out_path: Path):
     """Run TruffleHog filesystem scan on a single file."""
     cmd = f'trufflehog filesystem "{file_path}" --json'
-    stdout, stderr, rc = run_cmd(cmd, timeout=45)
+    stdout, stderr, rc = run_cmd(cmd, timeout=90)
     out_path.write_text(stdout if stdout else f"# stderr:\n{stderr}")
 
     findings = 0
@@ -90,7 +120,7 @@ def run_trufflehog(file_path: Path, out_path: Path):
 def run_trivy(file_path: Path, out_path: Path):
     """Run Trivy filesystem scan on a single file (config + vuln scanners)."""
     cmd = f'trivy fs --scanners vuln,secret,misconfig --format json "{file_path}"'
-    stdout, stderr, rc = run_cmd(cmd, timeout=60)
+    stdout, stderr, rc = run_cmd(cmd, timeout=120)
     out_path.write_text(stdout if stdout else f"# stderr:\n{stderr}")
 
     total, critical, high = 0, 0, 0
@@ -112,7 +142,7 @@ def run_trivy(file_path: Path, out_path: Path):
 def run_semgrep(file_path: Path, out_path: Path):
     """Run Semgrep with the OWASP Top 10-aligned ruleset (p/owasp-top-ten)."""
     cmd = f'semgrep --config p/owasp-top-ten --json "{file_path}"'
-    stdout, stderr, rc = run_cmd(cmd, timeout=60)
+    stdout, stderr, rc = run_cmd(cmd, timeout=120)
     out_path.write_text(stdout if stdout else f"# stderr:\n{stderr}")
 
     findings, errors = 0, 0
@@ -142,44 +172,51 @@ def run_slopsquatting(file_path: Path, language: str, out_path: Path):
     return checked, hallucinated, rate
 
 
-def discover_files():
-    """Walk generated_code/{model}/{language}/{condition}/*.ext and yield metadata."""
-    if not GENERATED_CODE_DIR.exists():
-        print(f"ERROR: {GENERATED_CODE_DIR} does not exist. Nothing to scan.")
+def discover_files(language: str):
+    """
+    Walk {Language}_generated_code/{model}/{naive|hinted}/promptN.ext
+    and yield metadata for every generated code file found.
+    """
+    root_dir = REPO_ROOT / LANG_FOLDER_NAMES[language]
+    if not root_dir.exists():
+        print(f"ERROR: {root_dir} does not exist. Nothing to scan.")
+        print(f"Run setup_{language}_structure.sh first to create the folder structure.")
         return
 
-    for model_dir in sorted(GENERATED_CODE_DIR.iterdir()):
+    ext = LANG_EXTENSIONS[language]
+    for model_dir in sorted(root_dir.iterdir()):
         if not model_dir.is_dir():
             continue
-        for lang_dir in sorted(model_dir.iterdir()):
-            if not lang_dir.is_dir() or lang_dir.name not in LANG_EXTENSIONS:
+        for cond_dir in sorted(model_dir.iterdir()):
+            if not cond_dir.is_dir() or cond_dir.name not in ("naive", "hinted"):
                 continue
-            for cond_dir in sorted(lang_dir.iterdir()):
-                if not cond_dir.is_dir() or cond_dir.name not in ("naive", "hinted"):
-                    continue
-                ext = LANG_EXTENSIONS[lang_dir.name]
-                for f in sorted(cond_dir.glob(f"*{ext}")):
-                    yield {
-                        "model": model_dir.name,
-                        "language": lang_dir.name,
-                        "condition": cond_dir.name,
-                        "prompt_id": f.stem,
-                        "file_path": f,
-                    }
+            for f in sorted(cond_dir.glob(f"*{ext}")):
+                yield {
+                    "model": model_dir.name,
+                    "language": language,
+                    "condition": cond_dir.name,
+                    "prompt_id": f.stem,
+                    "file_path": f,
+                }
 
 
 def main():
-    SCAN_RESULTS_DIR.mkdir(exist_ok=True)
+    if len(sys.argv) != 2 or sys.argv[1] not in LANG_EXTENSIONS:
+        print("Usage: python3 run_all_checks.py <python|javascript|java>")
+        sys.exit(1)
+
+    language = sys.argv[1]
+
     ANALYSIS_DIR.mkdir(exist_ok=True)
     csv_path = ANALYSIS_DIR / "master_results.csv"
 
-    files = list(discover_files())
+    files = list(discover_files(language))
     if not files:
-        print("No files found under ./generated_code. Check your folder structure.")
-        print("Expected: generated_code/{model}/{language}/{naive|hinted}/PNN.ext")
+        print(f"No files found under ./{LANG_FOLDER_NAMES[language]}. Check your folder structure.")
+        print(f"Expected: {LANG_FOLDER_NAMES[language]}/{{model}}/{{naive|hinted}}/promptN{LANG_EXTENSIONS[language]}")
         sys.exit(1)
 
-    print(f"Found {len(files)} file(s) to scan.\n")
+    print(f"Found {len(files)} file(s) to scan for language: {language}\n")
 
     write_header = not csv_path.exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as csvfile:
@@ -192,7 +229,10 @@ def main():
             fpath = item["file_path"]
             print(f"[{i}/{len(files)}] {model}/{lang}/{cond}/{pid}{fpath.suffix} ...", end=" ", flush=True)
 
-            result_prefix = SCAN_RESULTS_DIR / f"{model}_{lang}_{cond}_{pid}"
+            # Output structure: scan_results/{language}/{model}/{condition}/
+            result_dir = SCAN_RESULTS_DIR / lang / model / cond
+            result_dir.mkdir(parents=True, exist_ok=True)
+            result_prefix = result_dir / pid
             notes = []
 
             try:
@@ -244,7 +284,7 @@ def main():
             print("done" if not notes else f"done (warnings: {len(notes)})")
 
     print(f"\nAll results saved to: {csv_path}")
-    print(f"Raw per-tool outputs saved to: {SCAN_RESULTS_DIR}")
+    print(f"Raw per-tool outputs saved to: {SCAN_RESULTS_DIR / language}/{{model}}/{{naive|hinted}}/")
 
 
 if __name__ == "__main__":
