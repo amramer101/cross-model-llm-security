@@ -77,6 +77,7 @@ CSV_FIELDS = [
     "model", "language", "condition", "prompt_id", "file_path",
     "truffleHog_secrets_found",
     "trivy_vulnerabilities_found", "trivy_critical", "trivy_high",
+    "trivy_condition_level",          # always True -- Trivy runs per condition, not per file
     "semgrep_findings", "semgrep_errors",
     "slopsquatting_packages_checked", "slopsquatting_hallucinated",
     "slopsquatting_rate",
@@ -99,7 +100,7 @@ def run_cmd(cmd, timeout=60):
 
 def run_trufflehog(file_path: Path, out_path: Path):
     """Run TruffleHog filesystem scan on a single file."""
-    cmd = f'trufflehog filesystem "{file_path}" --json'
+    cmd = f'trufflehog filesystem "{file_path}" --json --no-update'
     stdout, stderr, rc = run_cmd(cmd, timeout=90)
     out_path.write_text(stdout if stdout else f"# stderr:\n{stderr}")
 
@@ -117,9 +118,55 @@ def run_trufflehog(file_path: Path, out_path: Path):
     return findings
 
 
-def run_trivy(file_path: Path, out_path: Path):
-    """Run Trivy filesystem scan on a single file (config + vuln scanners)."""
-    cmd = f'trivy fs --scanners vuln,secret,misconfig --format json "{file_path}"'
+MANIFEST_FILENAMES = {
+    ".py":   "requirements.txt",
+    ".js":   "package.json",
+    ".java": "pom.xml",
+}
+
+
+def run_trivy_for_condition(cond_dir: Path, language: str, out_path: Path):
+    """
+    Run Trivy ONCE per condition directory (naive/ or hinted/) on its
+    dependency manifest (requirements.txt / package.json / pom.xml).
+
+    Why per-condition, not per-file:
+      Trivy is a dependency scanner, not a source-code analyser.  It matches
+      package names against its CVE database.  A bare .py/.js/.java file has
+      no package metadata for Trivy to read -- only the manifest does.
+      Since one manifest covers all prompts in a condition folder, one Trivy
+      scan per condition is both correct and sufficient.
+
+    The result (total vulns, critical, high) is stored once and then stamped
+    onto every per-file CSV row for that condition, with the column
+    trivy_condition_level=True so analysts know the granularity.
+
+    Returns (total, critical, high) -- all zero if no manifest exists or
+    Trivy finds nothing.
+    """
+    ext = LANG_EXTENSIONS[language]
+    manifest_name = MANIFEST_FILENAMES.get(f".{language}" if language != "javascript" else ".js",
+                                           MANIFEST_FILENAMES.get(".py"))
+    # resolve manifest name from language key directly
+    manifest_map = {
+        "python":     "requirements.txt",
+        "javascript": "package.json",
+        "java":       "pom.xml",
+    }
+    manifest_name = manifest_map[language]
+    manifest_path = cond_dir / manifest_name
+
+    if not manifest_path.exists():
+        out_path.write_text(
+            f"# Trivy skipped: no {manifest_name} found in {cond_dir}\n"
+            f"# Run generate_manifests.py {language} first.\n"
+        )
+        return 0, 0, 0
+
+    cmd = (
+        f'trivy fs --scanners vuln --format json '
+        f'--include-dev-deps "{manifest_path}"'
+    )
     stdout, stderr, rc = run_cmd(cmd, timeout=120)
     out_path.write_text(stdout if stdout else f"# stderr:\n{stderr}")
 
@@ -218,6 +265,39 @@ def main():
 
     print(f"Found {len(files)} file(s) to scan for language: {language}\n")
 
+    # ------------------------------------------------------------------
+    # Pre-compute Trivy results per (model, condition) -- runs ONCE each.
+    # Key: (model, condition)  Value: (total, critical, high)
+    # ------------------------------------------------------------------
+    trivy_cache: dict = {}
+
+    def get_trivy_for_condition(model: str, cond: str, cond_dir: Path) -> tuple:
+        key = (model, cond)
+        if key not in trivy_cache:
+            result_dir = SCAN_RESULTS_DIR / language / model / cond
+            result_dir.mkdir(parents=True, exist_ok=True)
+            out_path = result_dir / "trivy.json"   # one file per condition, not per prompt
+            print(f"  [Trivy] scanning {model}/{cond}/requirements manifest ...", end=" ", flush=True)
+            try:
+                tv = run_trivy_for_condition(cond_dir, language, out_path)
+                print(f"done ({tv[0]} vulns, {tv[1]} critical, {tv[2]} high)")
+            except Exception as e:
+                tv = (0, 0, 0)
+                print(f"error: {e}")
+            trivy_cache[key] = tv
+        return trivy_cache[key]
+
+    # Run Trivy upfront for every unique (model, condition) we are about to scan
+    seen_conditions = set()
+    for item in files:
+        key = (item["model"], item["condition"])
+        if key not in seen_conditions:
+            seen_conditions.add(key)
+            cond_dir = item["file_path"].parent
+            get_trivy_for_condition(item["model"], item["condition"], cond_dir)
+
+    print()  # blank line before per-file scan output
+
     write_header = not csv_path.exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=CSV_FIELDS)
@@ -241,11 +321,8 @@ def main():
                 th_findings = 0
                 notes.append(f"truffleHog_error:{e}")
 
-            try:
-                tv_total, tv_crit, tv_high = run_trivy(fpath, Path(f"{result_prefix}_trivy.json"))
-            except Exception as e:
-                tv_total, tv_crit, tv_high = 0, 0, 0
-                notes.append(f"trivy_error:{e}")
+            # Trivy: fetch from cache (already ran per condition above)
+            tv_total, tv_crit, tv_high = trivy_cache.get((model, cond), (0, 0, 0))
 
             try:
                 sg_findings, sg_errors = run_semgrep(fpath, Path(f"{result_prefix}_semgrep.json"))
@@ -271,6 +348,7 @@ def main():
                 "trivy_vulnerabilities_found": tv_total,
                 "trivy_critical": tv_crit,
                 "trivy_high": tv_high,
+                "trivy_condition_level": True,
                 "semgrep_findings": sg_findings,
                 "semgrep_errors": sg_errors,
                 "slopsquatting_packages_checked": sl_checked,
