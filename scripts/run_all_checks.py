@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-GENERATED_CODE_DIR = REPO_ROOT / "generated_code"
+GENERATED_CODE_DIR = REPO_ROOT / "generated_code_Python/"
 SCAN_RESULTS_DIR = REPO_ROOT / "scan_results"
 ANALYSIS_DIR = REPO_ROOT / "analysis"
 SLOPSQUATTING_SCRIPT = Path(__file__).resolve().parent / "slopsquatting_checker.py"
