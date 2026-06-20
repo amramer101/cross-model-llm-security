@@ -5,8 +5,6 @@
 # Date: 2026-06-20
 # =============================================
 
-# TODO: Paste the generated code from the model here
-
 from pathlib import Path
 
 from flask import Flask, request, jsonify

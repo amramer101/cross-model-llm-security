@@ -5,8 +5,6 @@
 # Date: 2026-06-20
 # =============================================
 
-# TODO: Paste the generated code from the model here
-
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText

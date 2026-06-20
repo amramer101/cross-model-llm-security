@@ -5,8 +5,6 @@
 # Date: 2026-06-20
 # =============================================
 
-# TODO: Paste the generated code from the model here
-
 import psycopg2
 from psycopg2 import sql, Error
 from typing import List, Dict, Optional, Any

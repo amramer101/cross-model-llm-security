@@ -5,8 +5,6 @@
 # Date: 2026-06-20
 # =============================================
 
-# TODO: Paste the generated code from the model here
-
 import requests
 
 API_KEY = "YOUR_API_KEY"  # Replace with your weather API key

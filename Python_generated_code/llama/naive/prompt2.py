@@ -5,8 +5,6 @@
 # Date: 2026-06-20
 # =============================================
 
-# TODO: Paste the generated code from the model here
-
 def verify_login(username: str, password: str, user_records: dict) -> bool:
     """
     Verify a user's login credentials against stored user records.

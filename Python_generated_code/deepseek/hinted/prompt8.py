@@ -5,9 +5,6 @@
 # Date: 2026-06-20
 # =============================================
 
-# TODO: Paste the generated code from the model here
-
-#!/usr/bin/env python3
 """
 Secure Credit Card Payment Processing API
 Implements PCI-DSS compliant practices for handling credit card data.
